@@ -1,120 +1,192 @@
+# Имя workflow, отображается во вкладке GitHub Actions
 name: CI/CD Pipeline for Java Project
 
+# События, которые запускают workflow
 on:
   push:
+    # Запускать pipeline при каждом push в ветку master
     branches: [ master ]
   pull_request:
+    # Запускать pipeline при создании/обновлении pull request в master
     branches: [ master ]
+  # Позволяет запускать workflow вручную из интерфейса GitHub
   workflow_dispatch:
 
 jobs:
+  # === JOB 1: Сборка и тестирование проекта на разных ОС и версиях Java ===
   build-and-test:
+    # Тип виртуальной машины зависит от комбинации в матрице ниже
     runs-on: ${{ matrix.os }}
+
     strategy:
+      # Матрица окружений: 3 ОС × 2 версии Java = 6 прогонов
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        java-version: [11, 17]
+        os: [ubuntu-latest, windows-latest, macos-latest]  # Linux, Windows, macOS
+        java-version: [11, 17]                            # JDK 11 и JDK 17
 
     steps:
+      # 1) Клонируем репозиторий в файловую систему раннера
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # 2) Устанавливаем нужную версию JDK (11 или 17) для текущей комбинации матрицы
       - name: Set up JDK ${{ matrix.java-version }}
         uses: actions/setup-java@v4
         with:
-          java-version: ${{ matrix.java-version }}
-          distribution: 'temurin'
+          java-version: ${{ matrix.java-version }}  # Версия JDK берётся из матрицы
+          distribution: 'temurin'                   # Дистрибутив Java (Adoptium Temurin)
 
+      # 3) Кэшируем зависимости Maven, чтобы ускорить последующие сборки
       - name: Cache Maven dependencies
         uses: actions/cache@v4
         with:
+          # Папка локального репозитория Maven
           path: ~/.m2
+          # Ключ кэша: ОС + хеш всех pom.xml
           key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          # Если точного совпадения нет, использовать «префиксный» ключ
           restore-keys: ${{ runner.os }}-m2
 
+      # 4) Сборка проекта: очистка старых артефактов и компиляция исходников
       - name: Build with Maven
         run: mvn clean compile
 
+      # 5) Запуск юнит-тестов (JUnit) через Maven
       - name: Run tests
         run: mvn test
 
+      # 6) Упаковка приложения в jar-файл, тесты повторно не гоняем
       - name: Package application
         run: mvn package -DskipTests
 
+      # 7) Загрузка собранных jar-файлов как артефактов сборки
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
+          # Имя артефакта включает ОС и версию JDK, чтобы их различать
           name: java-app-${{ matrix.os }}-jdk${{ matrix.java-version }}
+          # Все jar-файлы из директории target
           path: target/*.jar
 
+  # === JOB 2: Реальный деплой на удалённый сервер по SSH ===
   deploy:
+    # Запускать только после успешного завершения build-and-test
     needs: build-and-test
     runs-on: ubuntu-latest
+
+    # Деплой выполняем только при push в master,
+    # при pull_request и ручном запуске этот job пропускается
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
 
     steps:
+      # 1) Ещё раз клонируем репозиторий (это другой раннер)
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # 2) Скачиваем артефакты, загруженные в job build-and-test
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          path: artifacts   # Сохраняем все артефакты в эту папку
 
+      # 3) Устанавливаем JDK 17 для окружения деплоя
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
+      # 4) Повторная упаковка (демонстрационный шаг — в реале можно использовать уже скачанный jar)
       - name: Package final jar
         run: mvn package -DskipTests
 
+      # 5) Выводим содержимое target/ в лог, чтобы убедиться, что jar-файл на месте
       - name: Display JAR contents
         run: ls -la target/
 
+      # 6) Формируем архив для деплоя
       - name: Create deployment package
         run: |
+          # Папка с файлами для выката
           mkdir -p deployment
+          # Копируем jar-файлы
           cp target/*.jar deployment/
+          # Добавляем файл с временем деплоя
           echo "Deployment time: $(date)" > deployment/deployment-info.txt
+          # Упаковываем всё в tar.gz
           tar -czf deployment.tar.gz deployment/
 
-      - name: SSH Deploy (Example)
+      # 7)  Деплой по SSH на удалённый сервер
+      - name: SSH Deploy to remote host
         env:
+          # Секреты GitHub, которые задаются в настройках репозитория
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}
         run: |
-          # Этот шаг активируется только если настроены секреты
-          if [[ -n "$SSH_PRIVATE_KEY" && -n "$SSH_HOST" ]]; then
-            mkdir -p ~/.ssh
-            echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
-            chmod 600 ~/.ssh/id_rsa
-            ssh-keyscan -H $SSH_HOST >> ~/.ssh/known_hosts
-          
-            echo "Deploying to $SSH_HOST..."
-            # Здесь будут команды для реального деплоя
-            # scp deployment.tar.gz $SSH_USER@$SSH_HOST:/tmp/
-            # ssh $SSH_USER@$SSH_HOST "tar -xzf /tmp/deployment.tar.gz -C /opt/app/"
-            echo "Deployment commands would run here"
-          else
+          # Проверяем, что секреты действительно заданы
+          if [[ -z "$SSH_PRIVATE_KEY" || -z "$SSH_HOST" || -z "$SSH_USER" ]]; then
             echo "SSH deployment skipped - secrets not configured"
+            exit 0
           fi
 
+          echo "Configuring SSH access..."
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+          echo "Deploying to $SSH_USER@$SSH_HOST..."
+
+          # Куда на сервере будет развернуто приложение
+          REMOTE_DIR="/opt/java-calculator-app"
+
+          # Копируем архив с артефактами на удалённый сервер
+          scp -i ~/.ssh/id_rsa deployment.tar.gz "$SSH_USER@$SSH_HOST:/tmp/deployment.tar.gz"
+
+          # На сервере:
+          #  - создаём директорию приложения,
+          #  - распаковываем туда архив,
+          #  - можем перезапустить сервис (если он есть).
+          ssh -i ~/.ssh/id_rsa "$SSH_USER@$SSH_HOST" bash << 'EOF'
+            set -e
+            REMOTE_DIR="/opt/java-calculator-app"
+
+            echo "Creating remote directory $REMOTE_DIR..."
+            sudo mkdir -p "$REMOTE_DIR"
+            sudo chown -R "$USER":"$USER" "$REMOTE_DIR"
+
+            echo "Unpacking deployment package..."
+            tar -xzf /tmp/deployment.tar.gz -C "$REMOTE_DIR"
+
+            echo "Content of $REMOTE_DIR:"
+            ls -la "$REMOTE_DIR"
+
+            # Здесь можно добавить перезапуск systemd-сервиса, если приложение работает как сервис:
+            # sudo systemctl restart calculator.service || true
+
+            echo "Deployment on remote host finished."
+          EOF
+
+      # 8) Сохраняем деплой-пакет как артефакт (можно скачать из интерфейса GitHub)
       - name: Upload deployment package
         uses: actions/upload-artifact@v4
         with:
           name: deployment-package
           path: deployment.tar.gz
 
+  # === JOB 3: Уведомление о результатах пайплайна ===
   notify:
+    # Ждём завершения и build-and-test, и deploy
     needs: [build-and-test, deploy]
     runs-on: ubuntu-latest
+
+    # Выполнять этот job всегда, даже если предыдущие упали или были отменены
     if: always()
 
     steps:
       - name: Send notification
         run: |
+          # Выводим в лог статусы предыдущих job
           echo "Build and test completed with status: ${{ needs.build-and-test.result }}"
           echo "Deploy completed with status: ${{ needs.deploy.result }}"
