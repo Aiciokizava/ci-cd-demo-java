@@ -2,10 +2,10 @@ name: CI/CD Pipeline for Java Project
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ master ]
   pull_request:
-    branches: [ main ]
-  workflow_dispatch:  # Ручной запуск
+    branches: [ master ]
+  workflow_dispatch:
 
 jobs:
   build-and-test:
